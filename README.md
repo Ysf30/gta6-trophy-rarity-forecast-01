@@ -34,14 +34,16 @@ rates**:
   (`E = round(rate * players / 100)`) and the players-tracked count.
 - **Players.** `N(t)` is fit as a power law in time since release on the
   states, so the join rate (new players syncing per hour) is known.
-- **Earners.** Each trophy's earners follow a cohort model: a player who
-  joined at time `s` earns trophy `i` by age `a` with probability
+- **Earners.** Each trophy's earners are its launch earners plus a cohort
+  model for everyone who joined after: a player who joined at time `s`
+  earns trophy `i` by age `a` with probability
   `q_inf_i / (1 + (a50_i / a)^p)` — a log-logistic progression curve with a
   per-trophy median time-to-earn `a50` and an eventual share `q_inf`.
-  Earners at time `t` are the join-rate-weighted sum over cohorts. `a50` and
-  `q_inf` are fit per trophy by grid search on the states, shrunk toward
-  priors by tier and story order (Chapter 1 is fast, the platinum is slow;
-  later chapters cannot out-earn earlier ones).
+  Earners at time `t` are the launch earners plus the join-rate-weighted
+  sum over cohorts. `a50` and `q_inf` are fit per trophy by grid search on
+  the states after the launch snapshot, shrunk weakly toward priors by
+  tier and story order (Chapter 1 is fast, the platinum is slow; later
+  chapters cannot out-earn earlier ones).
 - **The answer is a refresh, not a moment.** The graded read is the first one
   in the hour from the target, i.e. the page as of the *last refresh before
   the target*. The forecast is evaluated over the last-refresh window

@@ -59,14 +59,18 @@ EARLY_GROWTH = {
     51: 1.369, 52: 1.213, 53: 1.0, 54: 1.213, 55: 1.213,
 }
 
-# Cohort-curve search grids.
-A50_GRID = [0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+# Cohort-curve search grids. Clock-time progression is slow: the live page
+# shows most trophies' earners nearly frozen over day one while the tracked
+# population explodes, so the median time-to-earn runs to thousands of
+# hours for the late trophies.
+A50_GRID = [0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 P_GRID = [1.5, 2.0, 3.0]
 QINF_GRID = {
     "platinum": [0.002, 0.005, 0.01, 0.02, 0.05],
     "gold": [0.005, 0.01, 0.02, 0.05, 0.1, 0.2],
     "silver": [0.01, 0.02, 0.05, 0.1, 0.2, 0.35],
     "bronze": [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95],
+    "fishing": [0.99, 0.995, 0.999, 0.9995],
 }
 
 
@@ -144,9 +148,11 @@ def median_of(components):
 def states_from_history(history):
     """Collapse consecutive identical reads into refresh states.
 
-    Returns a list of states, oldest first, each with the time (hours since
-    the first read), the players-tracked count, and the integer earners per
-    trophy (None where the read lacked the trophy).
+    Returns a list of states, oldest first, each with its effective time
+    (hours since the first read; for a state after the first, the midpoint
+    between the previous state's last read and this state's first read --
+    the refresh happened in between), the players-tracked count, and the
+    integer earners per trophy (None where the read lacked the trophy).
     """
     states = []
     origin = None
@@ -156,8 +162,9 @@ def states_from_history(history):
             origin = at
         rates = tuple(read["rates"])
         n = read["players_tracked"]
+        t = (at - origin).total_seconds() / 3600.0
         if states and states[-1]["n"] == n and states[-1]["rates"] == rates:
-            states[-1]["last_t"] = (at - origin).total_seconds() / 3600.0
+            states[-1]["last_t"] = t
             continue
         earners = []
         for r in rates:
@@ -168,12 +175,15 @@ def states_from_history(history):
             else:
                 earners.append(int(round(r * n / 100.0)))
         states.append({
-            "t": (at - origin).total_seconds() / 3600.0,
-            "last_t": (at - origin).total_seconds() / 3600.0,
+            "t": t,
+            "first_t": t,
+            "last_t": t,
             "n": n,
             "rates": rates,
             "earners": earners,
         })
+    for prev, cur in zip(states, states[1:]):
+        cur["t"] = 0.5 * (prev["last_t"] + cur["first_t"])
     return states, origin
 
 
@@ -218,25 +228,31 @@ def median_refresh_interval(states):
 # ---------------------------------------------------------------- priors
 
 def trophy_priors(trophy):
-    """(a50_prior_hours, qinf_prior) from tier, story order and name."""
+    """(a50_prior_hours, qinf_prior) from tier, story order and name.
+
+    Clock-time progression is slow -- the live page shows most trophies'
+    earners nearly frozen over day one -- so the priors are in the
+    hundreds of hours for anything past the opening chapters. They are
+    weak (see fit_cohorts): the states decide.
+    """
     desc = (trophy.get("description") or "").lower()
     tier = trophy.get("tier") or "bronze"
-    a50 = {"platinum": 500.0, "gold": 180.0, "silver": 80.0,
-           "bronze": 25.0}.get(tier, 25.0)
+    a50 = {"platinum": 8000.0, "gold": 4000.0, "silver": 2000.0,
+           "bronze": 1000.0}.get(tier, 1000.0)
     qinf = {"platinum": 0.012, "gold": 0.06, "silver": 0.15,
             "bronze": 0.28}.get(tier, 0.28)
     if "chapter 1" in desc:
-        a50, qinf = 6.0, 0.78
+        a50, qinf = 120.0, 0.78
     elif "chapter 2" in desc:
-        a50, qinf = 14.0, 0.68
+        a50, qinf = 200.0, 0.68
     elif "chapter 3" in desc:
-        a50, qinf = 28.0, 0.58
+        a50, qinf = 350.0, 0.58
     elif "chapter 4" in desc:
-        a50, qinf = 48.0, 0.48
+        a50, qinf = 550.0, 0.48
     elif "final mission" in desc and "complete the final mission." in desc:
-        a50, qinf = 80.0, 0.38
+        a50, qinf = 800.0, 0.38
     if "100% completion" in desc:
-        a50, qinf = 500.0, 0.012
+        a50, qinf = 4000.0, 0.012
     if "gone fishing" in desc:
         a50, qinf = 0.5, 0.9995
     return a50, qinf
@@ -273,17 +289,33 @@ def cohort_share(a50, p, fit_n, eval_t, t_end):
 def fit_cohorts(case, states, origin):
     """Fit (a50, qinf, p) per trophy on the refresh states.
 
-    Returns (params, resid_sd) where params[trophy_index] = (a50, qinf, p)
-    and resid_sd[trophy_index] is the RMS logit residual of the fit.
+    The launch state (t near 0) is excluded: it reflects play before the
+    case's epoch, which the cohort curve cannot explain (it predicts zero
+    earners at t = 0). Earners at time t are modelled as the launch
+    earners plus the cohort earners of everyone who joined after the
+    epoch, so the predicted rate is (E_launch + N(t) * share) / N_obs --
+    which dips at a refresh (N jumps, earners lag) and recovers as
+    cohorts age. Priors are deliberately weak: two days of states must
+    be allowed to overrule them.
+
+    Returns (params, resid_sd, fit_n, p_best).
     """
     trophies = case["trophies"]
     target_t = (parse_time(case["target"]) - origin).total_seconds() / 3600.0
     fit_n = fit_players(states)
-    state_times = [st["t"] for st in states]
+    # Fitting states only: the launch snapshot is the anchor, not a point.
+    fit_states = [st for st in states if st["t"] > 0.5]
+    if not fit_states:
+        fit_states = states[-1:]
+    e_launch = []
+    for i in range(len(trophies)):
+        e = states[0]["earners"][i]
+        e_launch.append(0 if e is None else e)
+    state_times = [st["t"] for st in fit_states]
     obs = []
     for i in range(len(trophies)):
         row = []
-        for st in states:
+        for st in fit_states:
             r = st["rates"][i]
             row.append(None if r is None else logit(r))
         obs.append(row)
@@ -296,31 +328,48 @@ def fit_cohorts(case, states, origin):
             for t in eval_times:
                 share[(p, a50, t)] = cohort_share(a50, p, fit_n, t, target_t)
 
+    def pred_rate(i, a50, qinf, p, st):
+        s = share[(p, a50, st["t"])]
+        e_model = e_launch[i] + players_at(fit_n, st["t"]) * qinf * s
+        return clamp_pct(100.0 * e_model / max(st["n"], 1))
+
     best_total = {}
     best_params = {}
     for p in P_GRID:
         total_sse = 0.0
         for i, trophy in enumerate(trophies):
             a50_prior, qinf_prior = trophy_priors(trophy)
-            grid = QINF_GRID.get(trophy.get("tier") or "bronze",
-                                 QINF_GRID["bronze"])
+            if "gone fishing" in (trophy.get("description") or "").lower():
+                grid = QINF_GRID["fishing"]
+            else:
+                grid = QINF_GRID.get(trophy.get("tier") or "bronze",
+                                     QINF_GRID["bronze"])
             best = None
+            # A trophy whose rate has not started recovering from the
+            # dilution dip carries almost no signal about its day-7 level:
+            # the honest default is slow, not the prior's centre. When a
+            # rise is visible the data overrules the prior anyway.
+            rising = False
+            seen_rates = [r for r in [st["rates"][i] for st in fit_states]
+                          if r is not None]
+            if len(seen_rates) >= 2 and seen_rates[-1] > 1.25 * min(seen_rates):
+                rising = True
+            a50_w = 0.15 if rising else 0.4
+            a50_prior_i = a50_prior if rising else a50_prior * 1.5
             for a50 in A50_GRID:
-                s_vals = [share[(p, a50, t)] for t in state_times]
                 for qinf in grid:
                     sse = 0.0
                     cnt = 0
-                    for s, y in zip(s_vals, obs[i]):
+                    for st, y in zip(fit_states, obs[i]):
                         if y is None:
                             continue
-                        pred = logit(clamp_pct(100.0 * qinf * s))
-                        sse += (pred - y) ** 2
+                        sse += (logit(pred_rate(i, a50, qinf, p, st)) - y) ** 2
                         cnt += 1
                     if cnt == 0:
                         continue
-                    sse += 0.7 * ((math.log(a50) - math.log(a50_prior)) / 1.2) ** 2
-                    sse += 0.7 * ((logit(100.0 * qinf)
-                                  - logit(100.0 * qinf_prior)) / 1.5) ** 2
+                    sse += a50_w * ((math.log(a50) - math.log(a50_prior_i)) / 2.0) ** 2
+                    sse += 0.15 * ((logit(100.0 * qinf)
+                                   - logit(100.0 * qinf_prior)) / 2.5) ** 2
                     if best is None or sse < best[0]:
                         best = (sse, a50, qinf, cnt)
             if best is not None:
@@ -341,12 +390,10 @@ def fit_cohorts(case, states, origin):
         params[i] = (a50, qinf, p_best)
         sse = 0.0
         n_obs = 0
-        for st, y in zip(states, obs[i]):
+        for st, y in zip(fit_states, obs[i]):
             if y is None:
                 continue
-            s = share[(p_best, a50, st["t"])]
-            pred = logit(clamp_pct(100.0 * qinf * s))
-            sse += (pred - y) ** 2
+            sse += (logit(pred_rate(i, a50, qinf, p_best, st)) - y) ** 2
             n_obs += 1
         resid[i] = min(0.9, max(0.12, math.sqrt(sse / max(n_obs, 1))))
     return params, resid, fit_n, p_best
@@ -388,16 +435,33 @@ def cohort_forecast(case, states, origin):
     params, resid, fit_n, _ = fit_cohorts(case, states, origin)
     target_t = (parse_time(case["target"]) - origin).total_seconds() / 3600.0
     mu = median_refresh_interval(states)
+    days = max(case["horizon_minutes"] / 1440.0, 0.0)
     n_grid = 9
     t_grid = [target_t - mu + (mu * k / (n_grid - 1)) for k in range(n_grid)]
+    e_launch = []
+    for i in range(len(case["trophies"])):
+        e = states[0]["earners"][i]
+        e_launch.append(0 if e is None else e)
     rows = []
     for i, trophy in enumerate(case["trophies"]):
         a50, qinf, p = params[i]
+        # Parameter uncertainty dominates the timing window at this
+        # horizon, so the spread is the (doubled) fit residual plus a
+        # horizon term plus an extrapolation term: the further the
+        # evaluation time lies beyond the last observed state, the less
+        # the states can say about the level there. Floored so no trophy
+        # claims false precision.
+        t_last = max(st["t"] for st in states if st["t"] > 0.5)
+        extra = 0.25 * math.log(max(target_t - mu / 2.0, 1.0) / max(t_last, 1.0))
+        sd = min(1.4, max(0.30, 2.0 * resid[i] + 0.1 * math.sqrt(days)
+                          + max(0.0, extra)))
         comps = []
         for t in t_grid:
             s = cohort_share(a50, p, fit_n, t, target_t)
-            q = clamp_pct(100.0 * qinf * s)
-            comps.append((1.0, logit(q), resid[i]))
+            n_t = players_at(fit_n, t)
+            e_model = e_launch[i] + n_t * qinf * s
+            q = clamp_pct(100.0 * e_model / max(n_t, 1))
+            comps.append((1.0, logit(q), sd))
         rows.append((trophy["id"], mixture_quantiles(comps, LEVELS)))
     return rows
 
