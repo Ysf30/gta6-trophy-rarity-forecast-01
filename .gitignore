@@ -1,3 +1,6 @@
 notes/
 out/
 __pycache__/
+
+transcripts.tar.gz
+muse-usage.jsonl
